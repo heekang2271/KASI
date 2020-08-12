@@ -2,7 +2,7 @@ import os
 from astropy.io import fits
 import numpy as np
 import matplotlib.pyplot as plt
-
+import time
 
 # 파일 리스트 생성
 def getFileList(path):
@@ -14,11 +14,12 @@ def getFileList(path):
              (fits.open(path + "/" + fileList[0]))[0].header["EXPTIME"], \
              (fits.open(path + "/" + fileList[len(fileList)-1]))[0].header["EXPTIME"]
 
+    '''
     if "Light" in path :
         fileList = removeJuckFile(fileList, 2)
     else:
         fileList = removeJuckFile(fileList, len(fileList)//2)
-
+    '''
     return fileList, header
 
 
@@ -164,65 +165,63 @@ class CMOSCamera :
     def __init__(self, biasPath, lightPath):
         self.biasFileList, self.biasFileHeader = getFileList(biasPath)
         self.lightFileList, self.lightFileHeader = getFileList(lightPath)
-        self.col = self.lightFileHeader[0]
-        self.row = self.lightFileHeader[1]
+        self.col = self.lightFileHeader[1]
+        self.row = self.lightFileHeader[0]
         self.biasPath = biasPath
         self.lightPath = lightPath
 
-    # 특정 노출시간에 해당하는 사진파일들의 x, y좌표값에 해당하는 픽셀 데이터 추출
-    def dataGeneration(self, fileList, path, start, end, x, y):
+        self.run()
+
+    def run(self):
+        self.dataScan(200)
+
+    def dataGeneration(self, fileList, path, start, end):
         sepFileList = fileList[start:end]
         dataList = []
 
         for file in sepFileList:
-            dataList.append((fits.open(path + "/" + file))[0].data[y][x])
+            data = (fits.open(path + "/" + file))[0].data
+            dataList.append(data)
 
         return dataList
 
     def dataScan(self, iteration):
+        start = time.time()
         biasDataList = self.dataGeneration(self.biasFileList, self.biasPath, 0, len(self.biasFileList))
         biasDataList = np.array(biasDataList)
-        meanBiasData = np.mean(biasDataList)
+        meanBiasDataList = np.mean(biasDataList, axis = 0)
+        biasDataList = []
+        expStart = int(self.lightFileHeader[2])
+        expEnd = int(self.lightFileHeader[3])
 
-        lastExp = self.lightFileHeader[3]
+        varDataList = []
+        stdDataList = []
+        meanDataList = []
 
-        conversionGain = np.zeros(self.row, self.col)
-        maxADU = np.zeros(self.row, self.col)
-        fullWell = np.zeros(self.row, self.col)
-        linearity = np.zeros(self.row, self.col)
+        for i in range(0, expEnd - expStart + 1):
+            minusLightDataList = np.zeros((int(iteration/2), self.row, self.col)).astype(np.float32)
+            meanLightDataList = np.zeros((int(iteration/2), self.row, self.col)).astype(np.float32)
 
-        for i in range(self.row):
-            for j in range(self.col):
-                varArray = []
-                stdArray = []
-                meanArray = []
-                for k in range(lastExp):
-                    start = k * iteration
-                    end = start + iteration
+            for j in range(i*iteration, i*iteration + iteration, 2):
+                data1 = (fits.open(self.lightPath + "/" + self.lightFileList[j]))[0].data
+                data2 = (fits.open(self.lightPath + "/" + self.lightFileList[j+1]))[0].data
+                data1 = np.array(data1).astype(np.int32)
+                data2 = np.array(data2).astype(np.int32)
+                idx = int(j/2)
+                minusLightDataList[idx] = np.abs((data2 - data1)) / 2
+                meanLightDataList[idx] = (data1 + data2) / 2 - meanBiasDataList
+                data1 = []
+                data2 = []
 
-                    sepDataList = self.dataGeneration(self.lightFileList, self.lightPath, start, end, j, i)
-                    sepDataList = np.array(sepDataList)
+            # 노출시간 별, 모든 픽셀마다 var, std, mean값 생성
+            v = np.var(minusLightDataList, axis = 0)
+            varDataList.append(v)
+            stdDataList.append(np.sqrt(v))
+            meanDataList.append(np.mean(meanLightDataList, axis = 0))
 
-                    dataList = sepDataList[1::2] - sepDataList[0::2] - meanBiasData
-                    varArray.append(np.var(dataList))
-                    stdArray.append(np.std(dataList))
-                    meanArray.append(np.mean(dataList))
-
-                for iter in range(2, len(varArray)):
-                    slopeLeft = (np.polyfit(meanArray[:iter], varArray[:iter], 1))[0]
-                    slopeRight = (np.polyfit(meanArray[:iter+1], varArray[:iter+1], 1))[0]
-
-                    if np.abs(slopeRight/slopeLeft - 1) <= 0.2:
-                        continue
-                    else:
-                        conversionGain[i][j] = 1 / slopeLeft
-                        maxADU[i][j] = meanArray[varArray.argmax()]
-                        fullWell[i][j] = conversionGain[i][j] * maxADU[i][j]
-                        linearity[i][j] = iter
-                        break
-
-        return linearity, conversionGain, maxADU, fullWell
+        print("총 : ", time.time() - start)
 
 
 if __name__ == '__main__':
-    ccd = CCDCamera("EM003\Bias_1ms", "EM003\Light")
+    #ccd = CCDCamera("EM003\Bias_1ms", "EM003\Light")
+    cmos = CMOSCamera("Sample_Image\Dark_3s20200810", "Sample_Image\Light_3s20200810")
