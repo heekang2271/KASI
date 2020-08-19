@@ -2,10 +2,12 @@ import os
 from astropy.io import fits
 import numpy as np
 import matplotlib.pyplot as plt
+from tqdm import tqdm
 import time
+import pandas as pd
 
 # 파일 리스트 생성
-def getFileList(path):
+def getFileList(path, removeNum):
     fileList = os.listdir(path)
     fileList = fileList[4:]
 
@@ -14,12 +16,13 @@ def getFileList(path):
              (fits.open(path + "/" + fileList[0]))[0].header["EXPTIME"], \
              (fits.open(path + "/" + fileList[len(fileList)-1]))[0].header["EXPTIME"]
 
-    '''
-    if "Light" in path :
-        fileList = removeJuckFile(fileList, 2)
-    else:
-        fileList = removeJuckFile(fileList, len(fileList)//2)
-    '''
+
+    if removeNum != 0:
+        if "Light" in path :
+            fileList = removeJuckFile(fileList, removeNum)
+        else:
+            fileList = removeJuckFile(fileList, len(fileList)//removeNum)
+
     return fileList, header
 
 
@@ -34,13 +37,25 @@ def removeJuckFile(fileList, num):
 
     return newFileList
 
+def getData(fileList, path, start = 0, end = None, x = None, y = None, roi = None):
+    sepFileList = fileList[start:end]
+    dataList = []
+
+    for file in sepFileList:
+        data = (fits.open(path + "/" + file))[0].data
+        if roi != None:
+            data = data[y:y+2*roi, x:x+2*roi]
+        dataList.append(data)
+
+    return dataList
 
 class CCDCamera :
-    def __init__(self, biasPath, lightPath):
-        self.biasFileList, self.biasFileHeader = getFileList(biasPath)
-        self.lightFileList, self.lightFileHeader = getFileList(lightPath)
+    def __init__(self, biasPath, lightPath, roi, removeNum):
+        self.biasFileList, self.biasFileHeader = getFileList(biasPath, removeNum)
+        self.lightFileList, self.lightFileHeader = getFileList(lightPath, removeNum)
         self.col = self.lightFileHeader[1]
         self.row = self.lightFileHeader[0]
+        self.roi = roi
         self.biasPath = biasPath
         self.lightPath = lightPath
 
@@ -50,28 +65,17 @@ class CCDCamera :
         variance, signal, exp = self.dataProcessing()
         self.drawGraph(variance, signal, exp)
 
-    def roiLocation(self, row, col, roi):
-        return row//2 - roi , row//2 + roi, col//2 - roi, col//2 + roi
-
-    def dataGeneration(self, fileList, path, x1, x2, y1, y2):
-        dataList = []
-
-        for file in fileList:
-            data = (fits.open(path + "/" + file))[0].data
-            dataList.append(data[y1:y2, x1:x2])
-
-        return dataList
-
     def dataProcessing(self):
         variance = []
         signal = []
-        x1, x2, y1, y2 = self.roiLocation(self.row, self.col, 50)
 
-        biasDataList = self.dataGeneration(self.biasFileList, self.biasPath, 0, self.col, 0, self.row)
-        biasDataList = np.array(biasDataList)
+        x = self.col // 2 - self.roi
+        y = self.row // 2 - self.roi
+
+        biasDataList = getData(self.biasFileList, self.biasPath, x = x, y = y, roi = self.roi)
         meanBiasData = np.mean(biasDataList)
 
-        lightDataList = self.dataGeneration(self.lightFileList, self.lightPath, x1, x2, y1, y2)
+        lightDataList = getData(self.lightFileList, self.lightPath, x = x, y = y, roi = self.roi)
 
         for i in range(len(lightDataList)):
             lightDataList[i] = (lightDataList[i]) - meanBiasData
@@ -162,9 +166,9 @@ class CCDCamera :
 
 
 class CMOSCamera :
-    def __init__(self, biasPath, lightPath):
-        self.biasFileList, self.biasFileHeader = getFileList(biasPath)
-        self.lightFileList, self.lightFileHeader = getFileList(lightPath)
+    def __init__(self, biasPath, lightPath, removeNum):
+        self.biasFileList, self.biasFileHeader = getFileList(biasPath, removeNum)
+        self.lightFileList, self.lightFileHeader = getFileList(lightPath, removeNum)
         self.col = self.lightFileHeader[1]
         self.row = self.lightFileHeader[0]
         self.biasPath = biasPath
@@ -173,55 +177,100 @@ class CMOSCamera :
         self.run()
 
     def run(self):
-        self.dataScan(200)
-
-    def dataGeneration(self, fileList, path, start, end):
-        sepFileList = fileList[start:end]
-        dataList = []
-
-        for file in sepFileList:
-            data = (fits.open(path + "/" + file))[0].data
-            dataList.append(data)
-
-        return dataList
+        self.dataProcessing(200)
 
     def dataScan(self, iteration):
-        start = time.time()
-        biasDataList = self.dataGeneration(self.biasFileList, self.biasPath, 0, len(self.biasFileList))
-        biasDataList = np.array(biasDataList)
+        t = time.time()
+        biasDataList = getData(self.biasFileList, self.biasPath)
         meanBiasDataList = np.mean(biasDataList, axis = 0)
-        biasDataList = []
         expStart = int(self.lightFileHeader[2])
         expEnd = int(self.lightFileHeader[3])
 
-        varDataList = []
-        stdDataList = []
-        meanDataList = []
-
+        varDataList = np.zeros((expEnd - expStart + 1, self.row, self.col))
+        stdDataList = np.zeros((expEnd - expStart + 1, self.row, self.col))
+        meanDataList = np.zeros((expEnd - expStart + 1, self.row, self.col))
+        print("바이어스 처리 : ", time.time() - t)
         for i in range(0, expEnd - expStart + 1):
-            minusLightDataList = np.zeros((int(iteration/2), self.row, self.col)).astype(np.float32)
-            meanLightDataList = np.zeros((int(iteration/2), self.row, self.col)).astype(np.float32)
+            start = time.time()
 
+            t = time.time()
+            minusLightDataList = np.zeros((iteration//2, self.row, self.col), dtype=np.float32)
+            meanLightDataList = np.zeros((iteration//2, self.row, self.col), dtype=np.float32)
+            sumMinusDataList = np.zeros((1, self.row, self.col), dtype=np.float32)
+            sumMeanDataList = np.zeros((1, self.row, self.col), dtype=np.float32)
+            print("제로데이터 생성 : ", time.time() - t)
+
+            t = time.time()
             for j in range(i*iteration, i*iteration + iteration, 2):
                 data1 = (fits.open(self.lightPath + "/" + self.lightFileList[j]))[0].data
                 data2 = (fits.open(self.lightPath + "/" + self.lightFileList[j+1]))[0].data
-                data1 = np.array(data1).astype(np.int32)
-                data2 = np.array(data2).astype(np.int32)
-                idx = int(j/2)
+                data1 = np.array(data1, dtype=np.int32)
+                data2 = np.array(data2, dtype=np.int32)
+                idx = j//2
                 minusLightDataList[idx] = np.abs((data2 - data1)) / 2
                 meanLightDataList[idx] = (data1 + data2) / 2 - meanBiasDataList
-                data1 = []
-                data2 = []
-
+                sumMeanDataList += meanLightDataList[idx]
+                sumMinusDataList += minusLightDataList[idx]
+            print("데이터 처리 : ", time.time() - t)
+            '''
             # 노출시간 별, 모든 픽셀마다 var, std, mean값 생성
             v = np.var(minusLightDataList, axis = 0)
-            varDataList.append(v)
-            stdDataList.append(np.sqrt(v))
-            meanDataList.append(np.mean(meanLightDataList, axis = 0))
+            varDataList[i] = np.var(minusLightDataList, axis = 0)
+            stdDataList[i] = np.std(minusLightDataList) # 라이브러리 안쓰고 생성된 var 사용해 시간 약 200초 단축
+            meanDataList[i] = np.mean(meanLightDataList, axis = 0)
+            '''
+            t = time.time()
+            # 평균
+            meanDataList[i] = sumMeanDataList / (iteration//2)
 
-        print("총 : ", time.time() - start)
+            # 분산
+            varData = np.zeros((1, self.row, self.col), dtype=np.float32)
+            minusMean = sumMinusDataList / (iteration//2)
+            for k in range(len(minusLightDataList)):
+                var = minusLightDataList[k] - minusMean
+                var *= var
+                varData += var
+            varData /= (iteration//2)
+            varDataList[i] = varData
 
+            # 표준편차
+            stdDataList[i] = np.sqrt(varDataList[i])
+            print("평균, 분산, 표준편차 : ", time.time() - t)
+            print('#(%d/%d) : %f' %(i, expEnd - expStart + 1, time.time() - start))
+
+        return varDataList, stdDataList, meanDataList
+
+    def dataProcessing(self, slopeRatio):
+        varList, stdList, meanList = self.dataScan(200)
+
+        linearity = np.zeros((self.row, self.col))
+        conversionGain = np.zeros((self.row, self.col))
+        ADU_Max = np.zeros((self.row, self.col))
+        FullWell = np.zeros((self.row, self.col))
+        LogMeanStdSlope = np.zeros((self.row, self.col))
+
+        for i in range(self.row):
+            for j in range(self.col):
+                sepVarList = varList[:, i, j]
+                sepStdList = stdList[:, i, j]
+                sepMeanList = meanList[:, i, j]
+
+                for k in range(2, len(varList)):
+                    slopeLeft = (np.polyfit(sepMeanList[:k], sepVarList[:k], 1))[0]
+                    slopeRight = (np.polyfit(sepMeanList[:k + 1], sepVarList[:k + 1], 1))[0]
+
+                    if np.abs(slopeRight / slopeLeft - 1) <= slopeRatio:
+                        continue
+                    else:
+                        linearity[i, j] = k
+                        conversionGain[i, j] = 1 / slopeLeft
+                        LogMeanStdSlope[i, j] = (np.polyfit(np.log10(sepMeanList[:k + 1]), np.log10(sepStdList[:k + 1]), 1))[0]
+                        ADU_Max[i, j] = sepMeanList[sepVarList.argmax()]
+                        FullWell[i, j] = conversionGain[i, j] * ADU_Max[i, j]
+                        break
+
+        return linearity, conversionGain, ADU_Max, FullWell, LogMeanStdSlope
 
 if __name__ == '__main__':
-    #ccd = CCDCamera("EM003\Bias_1ms", "EM003\Light")
-    cmos = CMOSCamera("Sample_Image\Dark_3s20200810", "Sample_Image\Light_3s20200810")
+    #ccd = CCDCamera("EM003\Bias_1ms", "EM003\Light", 50, 2)
+    cmos = CMOSCamera("Sample_Image\Dark_3s20200810", "Sample_Image\Light_3s20200810", 0)
